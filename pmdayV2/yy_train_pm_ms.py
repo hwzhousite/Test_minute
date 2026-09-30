@@ -1659,10 +1659,9 @@ class LightningModel_PM(pl.LightningModule):
             target_price_tm = day_tm[:, :, self.args.price_target_index]  # 未来信息第m天(tm)的目标价 [B, M]
             target_price_allfuture = futureSeq[:, :, :, self.args.price_target_index]  # 未来信息的目标价 [B, M, pred_len]
 
-            stock_type_t1 = day_t1[:, :, -2]  # [B,M] 未来信息第1天(t1)的的股票类型
-            # 需要将这个数据反归一化,并转换为int类型
-            stock_type_t1 = stock_type_t1 * self.args.limit_mark_type + self.args.limit_mark_base  # [B,M]
-            stock_type_t1 = stock_type_t1.int()  # [B,M], 取值范围为1-5  {'主板': 1, '创业板': 2, '北交所': 3, '科创板': 4, 'ST': 5}
+            stock_type_t1 = day_t1[:, :, self.args.limit_mark_index]  # [B,M] 未来信息第1天(t1)的的股票类型
+            # src_data是未归一化的原始数据(与推理端一致), 直接转换为int类型即可, 无需反归一化
+            stock_type_t1 = stock_type_t1.round().int()  # [B,M], 取值范围为1-5  {'主板': 1, '创业板': 2, '北交所': 3, '科创板': 4, 'ST': 5}
 
             inputSeq = inputSeq.clone()
 
@@ -1740,8 +1739,8 @@ class LightningModel_PM(pl.LightningModule):
             if self.testing:
                 # 测试模型时,还要考虑padding的影响, 如果买入日或者交割日是padding的数据,表示真实交易无法发生
                 # 在这种情况下,将相对价格置为1
-                padd_mask_t2 = (day_t2[:, :, -1] > 0.0001)  # [B,M]
-                padd_mask_t1 = (day_t1[:, :, -1] > 0.0001)  # [B,M]
+                padd_mask_t2 = (day_t2[:, :, self.args.padding_flag_index] > 0.0001)  # [B,M]
+                padd_mask_t1 = (day_t1[:, :, self.args.padding_flag_index] > 0.0001)  # [B,M]
                 pm = padd_mask_t1 | padd_mask_t2  # [B,M]
                 next_relative_price[pm] = 1.0  # 置为1.0,表示真实交易无法发生
 
