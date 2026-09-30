@@ -1,0 +1,2 @@
+# shell脚本始终使用LF换行, 避免在Windows上checkout后拷到Linux服务器出现 "/bin/bash^M: bad interpreter"
+*.sh text eol=lf
