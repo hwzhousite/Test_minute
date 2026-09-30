@@ -77,7 +77,7 @@ def get_args():
     parser.add_argument('--indexpull', type=float, default=0., help='向指数权重回拉的强度, 0为不回拉')
 
     # 数据路径
-    parser.add_argument('--csv_path', type=str, default='', help='日线csv数据目录(DS=wd395时必须指定)')
+    parser.add_argument('--csv_path', type=str, default='', help='日线csv数据目录, 不指定则使用DS对应的默认目录(仅DS=wd395时生效)')
     parser.add_argument('--ms_data_path', type=str, default='/data/yy_data/five_minute_data/xt_260527_14f',
                         help='5分钟bin数据集目录(含bin_data/index.json/scaler_info.txt), 与训练使用的相同')
     parser.add_argument('--ms_min_cover', type=float, default=0.9, help='推理股票池中有分钟数据的股票占比下限, 低于则报错')
@@ -128,8 +128,11 @@ def get_args():
         args.keep_fields = [i for i in range(133)]  # 全部字段序列,一共133个
     elif args.DS == 'wd395':
         # Ex26_2 使用的395通道数据集(311基础字段 + 10风格暴露 + comovement + 31行业暴露 + 42因子收益)
-        assert args.csv_path != '', "DS=wd395 时必须用 --csv_path 指定日线csv数据目录"
-        args.g_csv_path = args.csv_path
+        args.g_csv_path = f"{CM.G_ROOT_PATH}/yy_data/qd/train/wd_395f_0819/260824/pads"  # 每日增量更新
+        args.scaler_file = f"{CM.G_ROOT_PATH}/yy_data/qd/train/wd_395f_0819/260824/scaler_info.json"  # 数据集对应的字段字典表文件路径
+        if args.csv_path != '':
+            args.g_csv_path = args.csv_path  # 命令行指定时覆盖默认目录
+        # 下面这个全局变量设置了交易日历列表
         with open(DT.g_calendar_file, 'r', encoding='utf-8-sig') as f:
             DT.g_calendar = json.load(f)
         args.keep_fields = [i for i in range(395)]
