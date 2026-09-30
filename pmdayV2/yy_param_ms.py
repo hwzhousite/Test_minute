@@ -731,6 +731,14 @@ def get_args(run_mode='train', episode_len=20, model='PM_SMV2', loadcheck='', ma
                                CM.find_str_in_list(args.input_channels, 'low_hfq'),
                                CM.find_str_in_list(args.input_channels, 'close_hfq')
                                ]  # '价格类字段的列索引'
+
+    # 股票类型(涨跌停限制类别)和padding标识的列索引: 按字段名查找, 395f中它们不在最末尾2列
+    # 旧数据集(字段名为'limit_mark'/'gen_padding_flag')中它们正好是最后2列, 找不到时退回-2/-1
+    args.limit_mark_index = next((i for i, f in enumerate(args.input_channels)
+                                  if f in ('f_s_limit_mark', 'limit_mark')), -2)
+    args.padding_flag_index = next((i for i, f in enumerate(args.input_channels)
+                                    if f in ('f_s_padding_flag', 'gen_padding_flag')), -1)
+
     if args.DS == 'day102':
         assert args.price_target in ['935', '5m', 'open'], 'day102数据集中，price_target只能为935或5m或open'
         pass
