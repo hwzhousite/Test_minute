@@ -4,7 +4,7 @@
 在 V5_calendar 基础上:
   - 分钟数据输出 [B, M, L, 48, C2]（按交易日 × 48 根 5 分钟）
   - 日线数据输出 [B, M, L, C1]
-  - 双数据集按交易日历对齐（同 V5 StockDataReaderTW）
+  - 日线决定样本与股票池，分钟数据按交易日历补充，缺失位置填零
   - 注册 xt_260527_14f 分钟数据集（14 列）
   - 双数据集 reader 支持 jiaoji_mode(stop_limit_mode 等) 与 zero_check_cols 过滤（与日线单数据集 reader 一致）
   - 支持 args.minute_offset_days: 分钟序列相对日线序列首日的偏移天数(按交易日历),
@@ -16,6 +16,8 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
+import numpy as np
 
 import torch
 from torch.utils.data import DataLoader
@@ -74,6 +76,76 @@ def _dataset_config_init_v11(self):
 
 
 DatasetConfig.__init__ = _dataset_config_init_v11
+
+
+class DailyWithMinuteDataset(torch.utils.data.Dataset):
+    """日线样本决定股票池和日期；分钟覆盖不足的位置填零。"""
+
+    def __init__(self, daily_dataset, reader):
+        self.daily_dataset = daily_dataset
+        self.reader = reader
+
+    def __len__(self):
+        return len(self.daily_dataset)
+
+    def __getitem__(self, idx):
+        day, group = self.daily_dataset.ds[idx][:2]
+        stocks = self.daily_dataset.get_si_stock_list(day, group)
+        daily = self.daily_dataset[idx]
+        return daily, self.reader.read_minutes(stocks, day)
+
+
+class DailyWithMinuteReader(v5.StockDataReaderON):
+    """严格复用原版日线样本生成，不以分钟索引筛选日线样本。"""
+
+    def __init__(self, args):
+        self.ms_data_config = DatasetConfig().get_config(args.ms_data_name)
+        with open(self.ms_data_config['index_file'], encoding='utf-8') as f:
+            self.ms_index = {str(k).split('.')[0].zfill(6): v for k, v in json.load(f).items()}
+        self.ms_calendar = [int(d) for d in calendar]
+        self.ms_calendar_index = {d: i for i, d in enumerate(self.ms_calendar)}
+        super().__init__(args)
+
+    def read_minutes(self, stocks, day):
+        days = self.args.minute_before_num + self.args.minute_after_num
+        channels = self.ms_data_config['channels']
+        out = np.zeros((len(stocks), days, 48, channels), dtype=np.float32)
+        offset = getattr(self.args, 'minute_offset_days',
+                         self.args.day_before_num - self.args.minute_before_num)
+        first = self.ms_calendar_index[int(day)] + offset
+        if first < 0 or first + days > len(self.ms_calendar):
+            raise ValueError('分钟窗口超出交易日历')
+        dtype = np.float64 if self.ms_data_config['accuracy'] == 'd' else np.float32
+        for j, stock in enumerate(stocks):
+            code = str(stock).split('.')[0].zfill(6)
+            info = self.ms_index.get(code)
+            if info is None:
+                continue
+            start, end = map(int, info[:2])
+            source_start = self.ms_calendar_index[start]
+            lo = max(first, source_start)
+            hi = min(first + days, self.ms_calendar_index[end] + 1)
+            if lo >= hi:
+                continue
+            path = os.path.join(self.ms_data_config['data_path_bin'], code + '.bin')
+            if not os.path.isfile(path):
+                continue
+            count = (hi - lo) * 48 * channels
+            data = np.fromfile(path, dtype=dtype, count=count,
+                               offset=(lo - source_start) * 48 * channels * np.dtype(dtype).itemsize)
+            # 短文件保留完整bar，其余填零；不改变日线样本。
+            bars = data.size // channels
+            dst = out[j].reshape(-1, channels)
+            begin = (lo - first) * 48
+            dst[begin:begin + bars] = data[:bars * channels].reshape(bars, channels)
+        return torch.from_numpy(out)
+
+    def create_data_loader(self, start_time, end_time, refresh=False, stride_shift=False):
+        loader = super().create_data_loader(start_time, end_time, refresh, stride_shift)
+        return DataLoader(DailyWithMinuteDataset(loader.dataset, self),
+                          batch_size=loader.batch_size, shuffle=self.args.shuffle,
+                          num_workers=loader.num_workers, drop_last=loader.drop_last,
+                          prefetch_factor=loader.prefetch_factor if loader.num_workers else None)
 
 
 class DiskBinDatasetTW_V11(v5.DiskBinDatasetTW):
@@ -389,7 +461,7 @@ class DataReaderV11:
     def create_data_reader(args):
         dc = DatasetConfig()
         if args.data_name in dc.config and args.ms_data_name in dc.config:
-            return StockDataReaderTW_V11(args)
+            return DailyWithMinuteReader(args)
         if args.data_name in dc.config:
             return StockDataReaderON_V11(args)
         if args.ms_data_name in dc.config:

@@ -1215,14 +1215,24 @@ class MinuteTSALayer(nn.Module):
                                                             norm_first=True)
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x):
+    def forward(self, x, valid=None):
         B, M, N, D = x.shape
-        x = self.time_encoder(x.reshape(B * M, N, D)).reshape(B, M, N, D)
+        if valid is None:
+            valid = torch.ones((B, M, N), dtype=torch.bool, device=x.device)
+        def safe_padding(v):
+            padding = ~v
+            padding = padding.clone()
+            padding[padding.all(dim=-1), 0] = False
+            return padding
+        x = self.time_encoder(x.reshape(B * M, N, D),
+                              src_key_padding_mask=safe_padding(valid.reshape(B * M, N)))
+        x = x.reshape(B, M, N, D) * valid.unsqueeze(-1)
         if self.stock_attn:
             x = x.permute(0, 2, 1, 3).reshape(B * N, M, D)
-            x = self.stock_encoder(x)
+            stock_valid = valid.permute(0, 2, 1).reshape(B * N, M)
+            x = self.stock_encoder(x, src_key_padding_mask=safe_padding(stock_valid))
             x = x.reshape(B, N, M, D).permute(0, 2, 1, 3)
-        return self.norm(x)
+        return self.norm(x) * valid.unsqueeze(-1)
 
 
 class MinuteStockRep(nn.Module):
@@ -1284,8 +1294,11 @@ class MinuteStockRep(nn.Module):
         x = self.fusion(x)  # [B, M, N, D]
         x = self.pre_norm(x + self.pos_embedding)
 
+        patch_valid = valid.reshape(B, M, self.num_patches, self.patch_size).any(dim=-1)
+        x = x * patch_valid.unsqueeze(-1)
+
         for layer in self.encoder:
-            x = layer(x)
+            x = layer(x, patch_valid)
 
         # patch内全部无效的patch不参与注意力池化
         patch_valid = valid.reshape(B, M, self.num_patches, self.patch_size).any(dim=-1)  # [B, M, N]
@@ -1295,7 +1308,7 @@ class MinuteStockRep(nn.Module):
         rep = torch.sum(x * attn.unsqueeze(-1), dim=-2)  # [B, M, D]
         rep = rep * patch_valid.any(dim=-1, keepdim=True).to(rep.dtype)  # 整段无分钟数据的股票置0
 
-        return self.out_proj(rep)  # [B, M, out_dim]
+        return self.out_proj(rep) * patch_valid.any(dim=-1, keepdim=True).to(rep.dtype)
 
 
 class MinuteGatedFusion(nn.Module):
@@ -1451,6 +1464,8 @@ class PortfolioModel_SMV2(nn.Module):
             rep_ms = checkpoint.checkpoint(self.representation_ms, ms_seq, use_reentrant=False)  # [B, M, D_ms]
             rep_day = rep_si
             rep_si, gate, delta = self.ms_fusion(rep_day, rep_ms, return_parts=True)
+            ms_valid = (ms_seq[..., self.representation_ms.close_index] > 0).any(dim=(-1, -2))
+            rep_si = torch.where(ms_valid.unsqueeze(-1), rep_si, rep_day)
             if show:
                 with torch.no_grad():
                     inj = (gate * delta).float()
