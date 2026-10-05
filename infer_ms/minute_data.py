@@ -6,7 +6,7 @@
   - {base}/index.json: {6位代码: [首日, 末日]}
   - {base}/scaler_info.txt: 字段字典(key的顺序即字段顺序)
 行号按交易日历计算(与训练reader的all_dates_index一致): 第D天的首根bar = (D在日历中的序号 - 首日序号) * 48
-实盘时需每天收盘后把bin数据增量更新到最新交易日, 否则推理会因覆盖率不足而报错
+分钟缺失或未更新的日期填零，默认退回日线；可显式设置min_cover启用覆盖率检查
 """
 
 import json
@@ -39,7 +39,7 @@ class MinuteBinReader:
         self.workers = workers
         self.date_fields = [self.fields.index(f) for f in ('gen_year', 'gen_month', 'gen_day')] \
             if all(f in self.fields for f in ('gen_year', 'gen_month', 'gen_day')) else None
-        self.data_last_day = max(v[1] for v in self.index.values())
+        self.data_last_day = max((v[1] for v in self.index.values()), default=0)
         print(f"分钟数据集{base_path}: 股票{len(self.index)}只, 数据最后日期{self.data_last_day}")
 
     def _read_one(self, code, first_day, last_day, days):
@@ -51,29 +51,33 @@ class MinuteBinReader:
         if info is None:
             return None, 'missing'
         s, e = info
-        if e < last_day:
-            return None, 'stale'  # 该股票分钟数据没有更新到last_day
+        read_last = min(e, last_day)
         if s > last_day:
             return None, 'missing'
         read_first = max(s, first_day)
+        if read_first > read_last:
+            return None, 'stale'
         start_row = (self.cal_index[read_first] - self.cal_index[s]) * MINUTE_BARS_PER_DAY
-        n_days = self.cal_index[last_day] - self.cal_index[read_first] + 1
+        n_days = self.cal_index[read_last] - self.cal_index[read_first] + 1
         count = n_days * MINUTE_BARS_PER_DAY * self.channels
-        data = np.fromfile(os.path.join(self.bin_path, f"{code}.bin"), dtype=self.dtype, count=count,
+        path = os.path.join(self.bin_path, f"{code}.bin")
+        if not os.path.isfile(path):
+            return None, 'missing'
+        data = np.fromfile(path, dtype=self.dtype, count=count,
                            offset=start_row * self.record_bytes)
-        if data.size != count:
-            return None, 'short'
         out = np.zeros((days, MINUTE_BARS_PER_DAY, self.channels), dtype=np.float32)
-        out[days - n_days:] = data.reshape(n_days, MINUTE_BARS_PER_DAY, self.channels)
-        return out, ('partial' if n_days < days else 'ok')
+        bars = data.size // self.channels
+        begin = (self.cal_index[read_first] - self.cal_index[first_day]) * MINUTE_BARS_PER_DAY
+        out.reshape(-1, self.channels)[begin:begin + bars] = data[:bars * self.channels].reshape(bars, self.channels)
+        return out, ('partial' if n_days < days or data.size != count else 'ok')
 
-    def read(self, stock_list, last_day, days, min_cover=0.9):
+    def read(self, stock_list, last_day, days, min_cover=0.0):
         """
         读取推理股票池截至last_day(含)最近days个交易日的分钟数据
         :param stock_list: 股票代码列表(如'000001.SZ'), 顺序与日线inputSeq的股票维一致
         :param last_day: 分钟窗口最后一天, 必须与日线回看窗口最后一天相同(即T-1)
         :param days: 天数(模型的ms_time_step)
-        :param min_cover: 有完整或部分分钟数据的股票占比下限, 低于它说明数据未更新/路径错误, 直接报错
+        :param min_cover: 完整或部分分钟数据的股票占比下限，默认0允许日线回退
         :return: [1, M, days, 48, C] float32
         """
         last_day = int(last_day)

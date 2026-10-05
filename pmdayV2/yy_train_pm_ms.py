@@ -2674,7 +2674,7 @@ class LightningModel_PM(pl.LightningModule):
             if self.trainer.is_global_zero:
                 totalBatchs = len(d_loader)
                 print(
-                    f"{CM.timestr()}***验证集{addinfo}总Batch数:{totalBatchs},batchSize:{self.args.batch_size},总样本数:{self.args.batch_size * totalBatchs}")
+                    f"{CM.timestr()}***验证集{addinfo}总Batch数:{totalBatchs},batchSize:{d_loader.batch_size},总样本数:{len(d_loader.dataset)}")
             return d_loader
         else:
             # 单独验证
@@ -2683,7 +2683,7 @@ class LightningModel_PM(pl.LightningModule):
             if self.trainer.is_global_zero:
                 totalBatchs = len(d_loader)
                 print(
-                    f"{CM.timestr()}***验证集{addinfo}总Batch数:{totalBatchs},batchSize:{self.args.batch_size},总样本数:{self.args.batch_size * totalBatchs}")
+                    f"{CM.timestr()}***验证集{addinfo}总Batch数:{totalBatchs},batchSize:{d_loader.batch_size},总样本数:{len(d_loader.dataset)}")
             return d_loader
 
     def test_dataloader(self):

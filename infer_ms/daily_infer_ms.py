@@ -785,7 +785,7 @@ def make_minute_seq(model_list, args, inputSeq, tradeDay, refer_stocklist):
         args.ms_reader = MinuteBinReader(getattr(args, 'ms_data_path', DEFAULT_MS_DATA_PATH),
                                          workers=getattr(args, 'ms_workers', 16))
     t0 = time.time()
-    ms_seq = args.ms_reader.read(refer_stocklist, last_day, days, min_cover=getattr(args, 'ms_min_cover', 0.9))
+    ms_seq = args.ms_reader.read(refer_stocklist, last_day, days, min_cover=getattr(args, 'ms_min_cover', 0.0))
     print(f"{DT.timestr()}分钟数据读取完成{tuple(ms_seq.shape)}, 耗时{time.time() - t0:.2f}秒")
     assert ms_seq.shape[1] == inputSeq.shape[1], "分钟数据与日线数据的股票数不一致"
     return ms_seq.to(args.device)

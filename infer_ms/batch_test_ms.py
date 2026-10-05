@@ -80,7 +80,7 @@ def get_args():
     parser.add_argument('--csv_path', type=str, default='', help='日线csv数据目录, 不指定则使用DS对应的默认目录(仅DS=wd395时生效)')
     parser.add_argument('--ms_data_path', type=str, default='/data/yy_data/five_minute_data/xt_260527_14f',
                         help='5分钟bin数据集目录(含bin_data/index.json/scaler_info.txt), 与训练使用的相同')
-    parser.add_argument('--ms_min_cover', type=float, default=0.9, help='推理股票池中有分钟数据的股票占比下限, 低于则报错')
+    parser.add_argument('--ms_min_cover', type=float, default=0.0, help='分钟覆盖率下限，默认0允许缺失并退回日线；设为正数启用严格检查')
     parser.add_argument('--ms_workers', type=int, default=16, help='读取分钟数据的线程数')
 
     args = parser.parse_args()
