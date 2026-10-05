@@ -239,6 +239,8 @@ def build_model(model_args, model_name, modelType):
 
         state_dict_pre = torch.load(model_name, map_location='cpu', weights_only=True)
         ret = model.load_state_dict(state_dict_pre, strict=False)
+        if ret.missing_keys or ret.unexpected_keys:
+            raise ValueError(f'模型结构与checkpoint不匹配，拒绝随机参数回测: {ret}')
         print(f"带模型源码方式,加载模型参数{model_name}:", ret)
         model.eval()
 
@@ -865,8 +867,10 @@ def infer_one_day(model_list, model_args, args, tradeDay, last_weight=None, with
     # stock_type_T0 = inputSeq[:, :, -1, -2].int().clone()  # [B,M]股票类型
     stock_type_T1, _ = UTILS.read_price_from_buffer(refer_stocklist, 'limit_mark', tradeDay)
     tmpList = []
-    for x, v in stock_type_T1.items():
-        tmpList.append(int(round(v[0])))
+    for stock in refer_stocklist:
+        if stock not in stock_type_T1:
+            raise ValueError(f'交易日股票类型缺失: {stock}')
+        tmpList.append(int(round(stock_type_T1[stock][0])))
     assert len(tmpList) == M, f"读取T1日股票类型数据不一致:{M} vs {len(tmpList)}"
     stock_type_T1 = torch.tensor(tmpList).int().unsqueeze(0).to(args.device)  # [B,M]
 
@@ -936,6 +940,7 @@ def infer_one_day(model_list, model_args, args, tradeDay, last_weight=None, with
             factor_exposure = torch.mean(factor_last_step, dim=1)  # dim=1 对应 M 维度
             daily_factor_exp = factor_exposure
             Index_weights_formodel = torch.full((1, M), 1.0 / M).to(args.device)
+            Index_weight = Index_weights_formodel
         else:
             if args.indexTarget == 'zz500':
                 index_pos = 303
@@ -954,6 +959,10 @@ def infer_one_day(model_list, model_args, args, tradeDay, last_weight=None, with
 
             # 2. 检查权重之和
             weight_sum = Index_weight.sum(dim=1)  # B
+            if not torch.isfinite(Index_weight).all() or (Index_weight < 0).any() or (weight_sum <= 0).any():
+                raise ValueError(f'无效基准指数权重: {args.indexTarget}, sum={weight_sum}')
+            Index_weight = Index_weight / weight_sum.unsqueeze(-1)
+            weight_sum = Index_weight.sum(dim=1)
             print('每个batch的权重之和:', weight_sum)
 
             # 3. 计算加权平均因子暴露 -> B * F
@@ -1177,7 +1186,7 @@ def infer_one_day(model_list, model_args, args, tradeDay, last_weight=None, with
     # ADD 20260304 在回测时做更严格的限制, 如果交易日收盘是涨停状态, 则默认今天的增仓无法完成
     # 这里可以复用上面的这个deal_illeagle_weight方法,传入is_up_stop参数,而此时该参数代表的是当日收盘是否涨停(而不是开盘了)
     # 读取交易日的收盘价
-    if tradeDay < DT.timestr(1):
+    if getattr(args, 'close_limit_filter', 0) and tradeDay < DT.timestr(1):
         cp, tl = UTILS.read_price_from_buffer(refer_stocklist, 'close', tradeDay)
         if tl != len(refer_stocklist):
             # 读取收盘价失败

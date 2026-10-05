@@ -826,6 +826,9 @@ def make_output_flag(args):
     if args.t > 0.0001:
         md = f"{md}_T{args.t}"
     md = f"{md}_m{args.minw}_m{args.max_sw}"
+    md += (f"_D{args.TD}_FC{args.Factor_constraint}_IX{args.indexTarget}"
+           f"_IP{args.indexpull}_PX{args.price_target}_FQ{args.fuquan}"
+           f"_CL{getattr(args, 'close_limit_filter', 0)}_V2")
     return md
 
 
@@ -859,9 +862,9 @@ def cal_tr(prev_w, next_w):
     if len(prev_w) == 0 and len(next_w) == 0:
         return 0.
     if len(prev_w) == 0:
-        return 1.0 - next_w['CASH']
+        return (1.0 - next_w['CASH']) / 2.
     if len(next_w) == 0:
-        return 1.0 - prev_w['CASH']
+        return (1.0 - prev_w['CASH']) / 2.
     ka = set(prev_w.keys())
     kb = set(next_w.keys())
     k = ka.union(kb)
@@ -876,6 +879,22 @@ def cal_tr(prev_w, next_w):
         elif key in next_w:
             tr += next_w[key]
     return tr / 2.
+
+
+def drift_weights(weights, previous_prices, current_prices):
+    """成交价变化后的交易前权重，仅用于费用核算，不向模型注入未来价格。"""
+    values = {}
+    for code, weight in weights.items():
+        ratio = 1.
+        if code != 'CASH':
+            p0, p1 = previous_prices.get(code), current_prices.get(code)
+            if p0 is not None and p1 is not None and p0 > 0 and p1 > 0:
+                ratio = p1 / p0
+        values[code] = weight * ratio
+    total = sum(values.values())
+    if total <= 0:
+        raise ValueError('交易前组合价值必须大于0')
+    return {code: value / total for code, value in values.items()}
 
 
 def make_link_url(stock_code):

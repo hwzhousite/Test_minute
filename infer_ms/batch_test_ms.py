@@ -31,7 +31,7 @@ def get_args():
     parser.add_argument('--cfd', type=str, default='20240101', help='交易日期起始点')
     parser.add_argument('--cld', type=str, default='20250630', help='交易日期终止点')
     parser.add_argument('--DS', type=str, default='day1062', help='数据集名称[day104,day106]')
-    parser.add_argument('--price_target', type=str, default='close_hfq', help='交易使用的价格字段,默认为空')
+    parser.add_argument('--price_target', type=str, default='', help='默认沿用模型训练成交价；可显式覆盖')
     # 复权处理: 对price_target要乘上复权因子后再使用, 如果本来就已经是复权价格了,则不可以再设置fuquan参数为1
     parser.add_argument('--fuquan', type=int, default=0,
                         help='是否要对价格进行复权操作,默认为0,设置为1则表示对price_target要做复权处理')
@@ -57,7 +57,7 @@ def get_args():
     parser.add_argument('--BJMAX', type=int, default=0, help='北交所股票总权重之上限,默认为0-不设限')
     parser.add_argument('--min_total_mv', type=int, default=0, help='限制进入推理池的股票的最小市值,默认为0表示不限制')
     parser.add_argument('--max_total_mv', type=int, default=0, help='限制进入推理池的股票的最大市值,默认为0表示不限制')
-    parser.add_argument('--mask_mf', type=int, default=0, help='特殊的数据处理模式[0,4,5,6,7,8]')
+    parser.add_argument('--mask_mf', type=int, default=602, help='当前组合模型使用602')
     parser.add_argument('--shuffle', type=int, default=1, help='排序参数')
     parser.add_argument('--split_year', type=int, default=1, help='是否分年,默认为1')
     parser.add_argument('--indexName', type=str, default='qa', help='确保{CM.G_ROOT_PATH}/indexData/下有同名的json文件')
@@ -71,7 +71,7 @@ def get_args():
 
     # Ex26_2 模型(mask_mf=602)推理参数
     parser.add_argument('--multitask', type=int, default=0, help='0: 调用forward(Ex26_2/5分钟模型均为0)')
-    parser.add_argument('--Factor_constraint', type=int, default=0,
+    parser.add_argument('--Factor_constraint', type=int, default=1,
                         help='风格约束方案 0无约束 1全约束 2严格风控(size/beta/resvol) 3风格轮动 4风格轮动2')
     parser.add_argument('--indexTarget', type=str, default='zz1000', help='基准指数[qa,hs300,zz500,zz1000,gz2000]')
     parser.add_argument('--indexpull', type=float, default=0., help='向指数权重回拉的强度, 0为不回拉')
@@ -82,6 +82,8 @@ def get_args():
                         help='5分钟bin数据集目录(含bin_data/index.json/scaler_info.txt), 与训练使用的相同')
     parser.add_argument('--ms_min_cover', type=float, default=0.0, help='分钟覆盖率下限，默认0允许缺失并退回日线；设为正数启用严格检查')
     parser.add_argument('--ms_workers', type=int, default=16, help='读取分钟数据的线程数')
+    parser.add_argument('--close_limit_filter', type=int, default=0,
+                        help='1启用事后收盘涨跌停过滤，默认0避免影响早盘交易')
 
     args = parser.parse_args()
     if args.MS > 0:
@@ -356,7 +358,10 @@ def period_test(args, model_list, begin_date, end_date, prev_weight=None, tradeC
         targetFile = UTILS.make_output_json_name(args, tradeDay)
         targetFile = os.path.join('./output', targetFile)
         if os.path.exists(targetFile):
-            # print(f"日期{tradeDay}的结果文件{targetFile}已存在, 跳过...")
+            prev_w = UTILS.read_pmfile(targetFile)
+            if prev_w is None:
+                raise ValueError(f'无法恢复已有仓位文件: {targetFile}')
+            args.keepWeightDays = (args.keepWeightDays % args.TD) + 1
             continue
         print(f"*****{DT.timestr()}开始进行交易日{tradeDay}处理...")
 
@@ -417,7 +422,7 @@ def period_test(args, model_list, begin_date, end_date, prev_weight=None, tradeC
         value, sc, sw, next_w = CalTool.cal_value_by_pmfile(targetFile, output=False, price_target=args.price_target,
                                                             fuquan=args.fuquan == 1)
         if value is None:
-            print(f"日期{tradeDay}的结果文件{targetFile}计算收益失败, 跳过...")
+            raise ValueError(f"日期{tradeDay}的结果文件{targetFile}计算收益失败")
         top1.append(getTop1StockWeight(next_w))
         mv.append(get_stock_average_MV(next_w, tradeDay))
         # print(f"----{tradeDay}---mv{mv[-1]}")
@@ -426,7 +431,14 @@ def period_test(args, model_list, begin_date, end_date, prev_weight=None, tradeC
         bj_c.append(bjc)
         bj_w.append(bjw)
         trade_days.append(tradeDay)
-        stepTr = UTILS.cal_tr(prev_w, next_w)
+        if prev_w:
+            previous_day = DT.get_real_next_trade_day(tradeDay, next_day=False)
+            previous_prices = CalTool.read_price(previous_day, args.price_target, prev_w, fuquan=args.fuquan == 1)
+            current_prices = CalTool.read_price(tradeDay, args.price_target, prev_w, fuquan=args.fuquan == 1)
+            execution_w = UTILS.drift_weights(prev_w, previous_prices, current_prices)
+        else:
+            execution_w = {}
+        stepTr = UTILS.cal_tr(execution_w, next_w)
         tr.append(stepTr)  # 换手率(单向)
         trade_value.append(value * (1. - 2 * stepTr * tradeCost))  # 双向扣除交易成本
         stock_count.append(sc)
@@ -871,17 +883,19 @@ def make_barra_year(year_day_list, year_weight):
     return year_ba
 
 
-def make_summery_info(all_trade_day_list, Day_model, year_ba):
+def make_summery_info(all_trade_day_list, Day_model, year_ba, args):
     # all_trade_day_list日期列表, Day_model是每日收益
     # year_ba是个list,每个元素是一个测试年的barra字典数据
     TD = len(all_trade_day_list)
     TM = len(Day_model)
     print(f"总交易日:{TD},模型日度相对收益列表长度:{TM}")
     assert TD == TM, "---请检查数据!!!---"
-    fn = './output/pd_list.json'
-    if os.path.exists(fn):
-        print(f"{fn}--模型每日收益数据文件已存在,将被覆盖,请注意!!!")
+    flag = UTILS.make_output_flag(args) + f'_COST{args.tradeCost}'
+    fn = f'./output/pd_list_{flag}.json'
     nv = {}
+    if os.path.exists(fn):
+        with open(fn, encoding='utf-8') as f:
+            nv.update(json.load(f))
     for day, val in zip(all_trade_day_list, Day_model):
         nv[day] = val
     with open(fn, 'w', encoding='utf-8') as f:
@@ -891,9 +905,12 @@ def make_summery_info(all_trade_day_list, Day_model, year_ba):
     total_ba = {}
     for bd in year_ba:
         total_ba.update(bd)
-    fn = "./output/pd_barra.json"
+    fn = f'./output/pd_barra_{flag}.json'
     if os.path.exists(fn):
-        print(f"{fn}--每日因子暴露和收益数据文件已存在,将被覆盖,请注意!!!")
+        with open(fn, encoding='utf-8') as f:
+            previous = json.load(f)
+        previous.update(total_ba)
+        total_ba = previous
     with open(fn, 'w', encoding='utf-8') as f:
         json.dump(total_ba, f, indent=1)
     return total_ba
@@ -1015,7 +1032,7 @@ if __name__ == '__main__':
         yc += 1
     if args.SUM == 1:
         # 是汇总脚本,则需要做一些额外处理
-        year_ba = make_summery_info(all_trade_day_list, Day_model, year_ba)
+        year_ba = make_summery_info(all_trade_day_list, Day_model, year_ba, args)
 
         # 总的有效测试年度数大于1时,出一个汇总报告
         logfile = open("./log.csv", "a+", encoding="utf-8-sig")
