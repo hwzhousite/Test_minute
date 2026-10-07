@@ -31,7 +31,7 @@ def get_args():
     parser.add_argument('--cfd', type=str, default='20240101', help='交易日期起始点')
     parser.add_argument('--cld', type=str, default='20250630', help='交易日期终止点')
     parser.add_argument('--DS', type=str, default='day1062', help='数据集名称[day104,day106]')
-    parser.add_argument('--price_target', type=str, default='', help='默认沿用模型训练成交价；可显式覆盖')
+    parser.add_argument('--price_target', type=str, default='close_hfq', help='与Template一致，默认close_hfq；传空字符串时继承训练配置')
     # 复权处理: 对price_target要乘上复权因子后再使用, 如果本来就已经是复权价格了,则不可以再设置fuquan参数为1
     parser.add_argument('--fuquan', type=int, default=0,
                         help='是否要对价格进行复权操作,默认为0,设置为1则表示对price_target要做复权处理')
@@ -82,8 +82,8 @@ def get_args():
                         help='5分钟bin数据集目录(含bin_data/index.json/scaler_info.txt), 与训练使用的相同')
     parser.add_argument('--ms_min_cover', type=float, default=0.0, help='分钟覆盖率下限，默认0允许缺失并退回日线；设为正数启用严格检查')
     parser.add_argument('--ms_workers', type=int, default=16, help='读取分钟数据的线程数')
-    parser.add_argument('--close_limit_filter', type=int, default=0,
-                        help='1启用事后收盘涨跌停过滤，默认0避免影响早盘交易')
+    parser.add_argument('--close_limit_filter', type=int, default=1,
+                        help='默认1，与Template一致执行当日收盘涨跌停过滤；0关闭')
 
     args = parser.parse_args()
     if args.MS > 0:
@@ -431,14 +431,8 @@ def period_test(args, model_list, begin_date, end_date, prev_weight=None, tradeC
         bj_c.append(bjc)
         bj_w.append(bjw)
         trade_days.append(tradeDay)
-        if prev_w:
-            previous_day = DT.get_real_next_trade_day(tradeDay, next_day=False)
-            previous_prices = CalTool.read_price(previous_day, args.price_target, prev_w, fuquan=args.fuquan == 1)
-            current_prices = CalTool.read_price(tradeDay, args.price_target, prev_w, fuquan=args.fuquan == 1)
-            execution_w = UTILS.drift_weights(prev_w, previous_prices, current_prices)
-        else:
-            execution_w = {}
-        stepTr = UTILS.cal_tr(execution_w, next_w)
+        # Template口径：直接比较前一次目标持仓与当前目标持仓。
+        stepTr = UTILS.cal_tr(prev_w, next_w)
         tr.append(stepTr)  # 换手率(单向)
         trade_value.append(value * (1. - 2 * stepTr * tradeCost))  # 双向扣除交易成本
         stock_count.append(sc)

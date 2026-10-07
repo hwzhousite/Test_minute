@@ -17,10 +17,38 @@ def functions(path, names, ns):
 
 
 class AccountingTests(unittest.TestCase):
+    def test_template_turnover_cases(self):
+        tr = functions('infer_ms/utils.py', {'cal_tr'}, {})['cal_tr']
+        cases = [({}, {}, 0.), ({}, {'CASH': .2, 'A': .8}, .8),
+                 ({'CASH': .2, 'A': .8}, {}, .8),
+                 ({'CASH': .2, 'A': .8}, {'CASH': .4, 'A': .6}, .1),
+                 ({'CASH': 0., 'A': .5, 'B': .5},
+                  {'CASH': 0., 'A': .5, 'B': .5}, 0.)]
+        for prev, nxt, expected in cases:
+            self.assertAlmostEqual(tr(prev, nxt), expected)
+
+    def test_template_execution_defaults(self):
+        tree = ast.parse((ROOT / 'infer_ms/batch_test_ms.py').read_text())
+        defaults = {}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == 'add_argument' and node.args
+                    and isinstance(node.args[0], ast.Constant)):
+                for keyword in node.keywords:
+                    if keyword.arg == 'default' and isinstance(keyword.value, ast.Constant):
+                        defaults[node.args[0].value] = keyword.value.value
+        self.assertEqual(defaults['--price_target'], 'close_hfq')
+        self.assertEqual(defaults['--close_limit_filter'], 1)
+        period = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'period_test')
+        call = next(n for n in ast.walk(period) if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute) and n.func.attr == 'cal_tr')
+        self.assertEqual([n.id for n in call.args], ['prev_w', 'next_w'])
+
     def test_initial_buy_and_rebalance_cost(self):
         ns = functions('infer_ms/utils.py', {'cal_tr', 'drift_weights'}, {})
         tr = ns['cal_tr']
-        self.assertAlmostEqual(2 * tr({}, {'CASH': 0., 'A': 1.}) * .0005, .0005)
+        # Preserve Template's initial double-sided fee convention.
+        self.assertAlmostEqual(2 * tr({}, {'CASH': 0., 'A': 1.}) * .0005, .001)
         self.assertEqual(tr({'CASH': 0., 'A': 1.}, {'CASH': 0., 'B': 1.}), 1.)
         w = ns['drift_weights']({'CASH': 0., 'A': .5, 'B': .5},
                                {'A': 10., 'B': 10.}, {'A': 20., 'B': 10.})

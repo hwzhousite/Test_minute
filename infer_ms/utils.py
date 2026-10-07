@@ -828,7 +828,7 @@ def make_output_flag(args):
     md = f"{md}_m{args.minw}_m{args.max_sw}"
     md += (f"_D{args.TD}_FC{args.Factor_constraint}_IX{args.indexTarget}"
            f"_IP{args.indexpull}_PX{args.price_target}_FQ{args.fuquan}"
-           f"_CL{getattr(args, 'close_limit_filter', 0)}_V2")
+           f"_CL{getattr(args, 'close_limit_filter', 1)}_TemplateV3")
     return md
 
 
@@ -862,9 +862,9 @@ def cal_tr(prev_w, next_w):
     if len(prev_w) == 0 and len(next_w) == 0:
         return 0.
     if len(prev_w) == 0:
-        return (1.0 - next_w['CASH']) / 2.
+        return 1.0 - next_w['CASH']
     if len(next_w) == 0:
-        return (1.0 - prev_w['CASH']) / 2.
+        return 1.0 - prev_w['CASH']
     ka = set(prev_w.keys())
     kb = set(next_w.keys())
     k = ka.union(kb)
