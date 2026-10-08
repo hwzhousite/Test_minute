@@ -56,8 +56,8 @@ class AccountingTests(unittest.TestCase):
         self.assertAlmostEqual(sum(w.values()), 1.)
         self.assertAlmostEqual(tr(w, {'CASH': 0., 'A': .5, 'B': .5}), 1 / 6)
 
-    def test_summary_preserves_other_dates(self):
-        ns = functions('infer_ms/batch_test_ms.py', {'make_summery_info'},
+    def test_template_summary_preserves_other_dates(self):
+        ns = functions('infer_ms/batch_test_ms.py', {'make_summery_info', 'merge_dict'},
                        dict(json=json, os=os, UTILS=SimpleNamespace(make_output_flag=lambda a: 'experiment')))
         old = os.getcwd()
         with tempfile.TemporaryDirectory() as tmp:
@@ -66,14 +66,14 @@ class AccountingTests(unittest.TestCase):
                 Path('output').mkdir()
                 fn = ns['make_summery_info']
                 args = SimpleNamespace(tradeCost=.0005)
-                fn(['20250101'], [1.01], [{'20250101': {'alpha': 1}}], args)
-                fn(['20260101'], [1.02], [{'20260101': {'alpha': 2}}], args)
-                x = json.loads(Path('output/pd_list_experiment_COST0.0005.json').read_text())
+                fn(['20250101'], [1.01], [{'20250101': {'alpha': 1}}])
+                fn(['20260101'], [1.02], [{'20260101': {'alpha': 2}}])
+                x = json.loads(Path('output/pd_list.json').read_text())
                 self.assertEqual(set(x), {'20250101', '20260101'})
             finally:
                 os.chdir(old)
 
-    def test_resume_passes_last_saved_weights(self):
+    def test_resume_matches_template_skip_behavior(self):
         saved = {'CASH': .25, 'A': .75}
         received = []
         args = SimpleNamespace(TD=1, keepWeightDays=1, withBJ=False, shuffle=0)
@@ -93,7 +93,7 @@ class AccountingTests(unittest.TestCase):
                             InferTool=SimpleNamespace(infer_one_day=infer)))
         with self.assertRaises(Done):
             ns['period_test'](args, [], '1', '2')
-        self.assertEqual(received, [saved])
+        self.assertEqual(received, [None])
 
 
 if __name__ == '__main__':

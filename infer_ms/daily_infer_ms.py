@@ -867,10 +867,15 @@ def infer_one_day(model_list, model_args, args, tradeDay, last_weight=None, with
     # stock_type_T0 = inputSeq[:, :, -1, -2].int().clone()  # [B,M]股票类型
     stock_type_T1, _ = UTILS.read_price_from_buffer(refer_stocklist, 'limit_mark', tradeDay)
     tmpList = []
-    for stock in refer_stocklist:
-        if stock not in stock_type_T1:
-            raise ValueError(f'交易日股票类型缺失: {stock}')
-        tmpList.append(int(round(stock_type_T1[stock][0])))
+    if any(getattr(m, 'use_minute', False) for m in model_list):
+        for stock in refer_stocklist:
+            if stock not in stock_type_T1:
+                raise ValueError(f'交易日股票类型缺失: {stock}')
+            tmpList.append(int(round(stock_type_T1[stock][0])))
+    else:
+        # Pure-daily compatibility: preserve Template's dictionary insertion order.
+        for x, v in stock_type_T1.items():
+            tmpList.append(int(round(v[0])))
     assert len(tmpList) == M, f"读取T1日股票类型数据不一致:{M} vs {len(tmpList)}"
     stock_type_T1 = torch.tensor(tmpList).int().unsqueeze(0).to(args.device)  # [B,M]
 

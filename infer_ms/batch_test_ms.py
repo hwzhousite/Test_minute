@@ -1,37 +1,39 @@
-# 进行批量测试 (Ex26_2日频框架 + 5分钟数据分支的模型, 推理见 daily_infer_ms.py)
+# 进行批量测试
 import argparse
 import copy
 import json
 import os
+
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+import warnings
+
+warnings.filterwarnings("ignore")
 import time
 import numpy as np
 import torch
 import utils_date as DT
 import utils as UTILS
 import common_utils as CM
+from data_utils import DataNormalizer_SWSJ
 import daily_infer_ms as InferTool
 import cal_value as CalTool
 import sys
 
 sys.path.append("../")
 import eval.utils_barra as BA
-import warnings
-
-warnings.filterwarnings("ignore")
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 
 def get_args():
     parser = argparse.ArgumentParser(description='Portfolio Parameter')
     parser.add_argument('--GPU', type=int, default=0, help='[0,1,2..]表示用哪一块GPU, 默认为0, -1表示不使用GPU')
     parser.add_argument('--MODELTYPE', type=str, default='A', help='[A,B,SUB01,SUPER]')
-    parser.add_argument('--TD', type=int, default=1, help='多少天执行一次交易,默认为1,即每天都推理交交易')
+    parser.add_argument('--TD', type=int, default=1, help='多少天执行一次交易,默认为1,即每天都推理交易')
     parser.add_argument('--skipLoss', type=float, default=1.0,
                         help='跳过开盘跌幅大于skipLoss的股票, 默认为1.0(即100%,不跳过)')
     parser.add_argument('--cfd', type=str, default='20240101', help='交易日期起始点')
     parser.add_argument('--cld', type=str, default='20250630', help='交易日期终止点')
     parser.add_argument('--DS', type=str, default='day1062', help='数据集名称[day104,day106]')
-    parser.add_argument('--price_target', type=str, default='close_hfq', help='与Template一致，默认close_hfq；传空字符串时继承训练配置')
+    parser.add_argument('--price_target', type=str, default='close_hfq', help='交易使用的价格字段,默认为空')
     # 复权处理: 对price_target要乘上复权因子后再使用, 如果本来就已经是复权价格了,则不可以再设置fuquan参数为1
     parser.add_argument('--fuquan', type=int, default=0,
                         help='是否要对价格进行复权操作,默认为0,设置为1则表示对price_target要做复权处理')
@@ -47,8 +49,7 @@ def get_args():
     parser.add_argument('--minw', type=float, default=0.0005, help='最小权重, 默认为0.001')
     parser.add_argument('--max_sw', type=float, default=0.05, help='单只股票的最大权重,默认为1即为不设限')
     parser.add_argument('--movecash', type=int, default=0, help='砍掉的仓位放到哪里?0---现金  1---股票')
-
-    # 如果设置了maxtop1为某个小于1的值,比如说0.05, 则在做权重平滑处理时,所有大于0.05的权重都会被削去多于0.05的部分,转移到现金上  ADD 20260304
+    # 如果设置了max_sw为某个小于1的值,比如说0.05, 则在做权重平滑处理时,所有大于0.05的权重都会被削去多于0.05的部分,转移到现金上  ADD 20260304
     parser.add_argument('--amount5', type=float, default=1000,
                         help='过于5天的日均成交额下限,低于此下限的股票不进入推理池')  # ADD 20260304
     parser.add_argument('--ext_day', type=int, default=0, help='额外向历史方向读取数据多少天(用于过滤)')
@@ -57,24 +58,23 @@ def get_args():
     parser.add_argument('--BJMAX', type=int, default=0, help='北交所股票总权重之上限,默认为0-不设限')
     parser.add_argument('--min_total_mv', type=int, default=0, help='限制进入推理池的股票的最小市值,默认为0表示不限制')
     parser.add_argument('--max_total_mv', type=int, default=0, help='限制进入推理池的股票的最大市值,默认为0表示不限制')
-    parser.add_argument('--mask_mf', type=int, default=602, help='当前组合模型使用602')
+    parser.add_argument('--mask_mf', type=int, default=602, help='特殊的数据处理模式[0,4,5,6,7,8]')
     parser.add_argument('--shuffle', type=int, default=1, help='排序参数')
     parser.add_argument('--split_year', type=int, default=1, help='是否分年,默认为1')
     parser.add_argument('--indexName', type=str, default='qa', help='确保{CM.G_ROOT_PATH}/indexData/下有同名的json文件')
+    parser.add_argument('--indexTarget', type=str, default='qa', help='确保{CM.G_ROOT_PATH}/indexData/下有同名的json文件')
+    parser.add_argument('--Factor_constraint', type=int, default=1, help='[A-多头, B-10因子指增，C-风格硬控, D-风格轮动, E-风格轮动（开放动量）]')
     parser.add_argument('--stockpool', type=str, default='', help='指定推理股票池')
+    parser.add_argument('--multitask', type=int, default=0, help='多任务--- 0：单任务，1：约束任务，2：多头任务')
+    parser.add_argument('--indexpull', type=float, default=0, help='多任务--- 0：不优化，100：100优化，200 ：200优化')
+    # 以下为优化器相关参数
+    parser.add_argument('--optimizer', type=int, default=0, help='') #是否使用优化器的总开关
     parser.add_argument('--opv', type=int, default=0, help='')
     parser.add_argument('--opv_f', type=float, default=0.01, help='')
-    parser.add_argument('--optimizer', type=int, default=0, help='')
     parser.add_argument('--op_fn', type=int, default=10, help='优化器要优化的因子个数')
     parser.add_argument('--op_to', type=float, default=10., help='维持原始权重的程度参数,值越大表示越靠近原始值')
+    # 汇总参数,当它被设置为1时,才做barra相关的统计
     parser.add_argument('--SUM', type=int, default=0, help='汇总时传1')
-
-    # Ex26_2 模型(mask_mf=602)推理参数
-    parser.add_argument('--multitask', type=int, default=0, help='0: 调用forward(Ex26_2/5分钟模型均为0)')
-    parser.add_argument('--Factor_constraint', type=int, default=1,
-                        help='风格约束方案 0无约束 1全约束 2严格风控(size/beta/resvol) 3风格轮动 4风格轮动2')
-    parser.add_argument('--indexTarget', type=str, default='zz1000', help='基准指数[qa,hs300,zz500,zz1000,gz2000]')
-    parser.add_argument('--indexpull', type=float, default=0., help='向指数权重回拉的强度, 0为不回拉')
 
     # 数据路径
     parser.add_argument('--csv_path', type=str, default='', help='日线csv数据目录, 不指定则使用DS对应的默认目录(仅DS=wd395时生效)')
@@ -128,23 +128,32 @@ def get_args():
         with open(DT.g_calendar_file, 'r', encoding='utf-8') as f:
             DT.g_calendar = json.load(f)
         args.keep_fields = [i for i in range(133)]  # 全部字段序列,一共133个
-    elif args.DS == 'wd395':
-        # Ex26_2 使用的395通道数据集(311基础字段 + 10风格暴露 + comovement + 31行业暴露 + 42因子收益)
-        args.g_csv_path = f"{CM.G_ROOT_PATH}/yy_data/qd/train/wd_395f_0819/260824/pads"  # 每日增量更新
-        args.scaler_file = f"{CM.G_ROOT_PATH}/yy_data/qd/train/wd_395f_0819/260824/scaler_info.json"  # 数据集对应的字段字典表文件路径
-        if args.csv_path != '':
-            args.g_csv_path = args.csv_path  # 命令行指定时覆盖默认目录
-        # 下面这个全局变量设置了交易日历列表
-        with open(DT.g_calendar_file, 'r', encoding='utf-8-sig') as f:
-            DT.g_calendar = json.load(f)
-        args.keep_fields = [i for i in range(395)]
     elif args.DS == 'wd311':
-        args.g_csv_path = f"{CM.G_ROOT_PATH}/yy_data/qd/train/wd_311f/0723/pads/"  # 每日增量更新
+        args.g_csv_path = f"{CM.G_ROOT_PATH}/yy_data/qd/train/wd_311f/0702/pads"  # 每日增量更新
+        args.scaler_file = f"{CM.G_ROOT_PATH}/yy_data/qd/train/wd_311f/0702/scaler_info.txt"  # 数据集对应的字段字典表文件路径
         # 下面这个全局变量设置了交易日历列表
         # 一旦被设置, 则所有与日期相关的计算(比如获取前一交易日/下一交易日)就依赖这个交易日历来进行了
         with open(DT.g_calendar_file, 'r', encoding='utf-8-sig') as f:
             DT.g_calendar = json.load(f)
         args.keep_fields = [i for i in range(310)]  # 全部字段序列,一共310个
+    elif args.DS == 'wd395': # /data/yy_data/qd/train/wd_barra_395f_1231/0727/
+        args.g_csv_path = f"{CM.G_ROOT_PATH}/yy_data/qd/train/wd_395f_0819/260824/pads"  # 每日增量更新
+        if args.csv_path:
+            args.g_csv_path = args.csv_path
+        args.scaler_file = f"{CM.G_ROOT_PATH}/yy_data/qd/train/wd_395f_0819/260824/scaler_info.json"  # 数据集对应的字段字典表文件路径
+        # 下面这个全局变量设置了交易日历列表
+        # 一旦被设置, 则所有与日期相关的计算(比如获取前一交易日/下一交易日)就依赖这个交易日历来进行了
+        with open(DT.g_calendar_file, 'r', encoding='utf-8-sig') as f:
+            DT.g_calendar = json.load(f)
+        args.keep_fields = [i for i in range(394)]  # 全部字段序列,一共394个
+    elif args.DS == 'day196':
+        args.g_csv_path = f"{CM.G_ROOT_PATH}/raw_generated_data/tushare_data/ts_260525_196f/tgt_pad_data"  # 每日增量更新
+        args.scaler_file = f"{CM.G_ROOT_PATH}/yy_data/tushare_data/ts_260525_196f/scaler_info.txt"  # 数据集对应的字段字典表文件路径
+        # 下面这个全局变量设置了交易日历列表
+        # 一旦被设置, 则所有与日期相关的计算(比如获取前一交易日/下一交易日)就依赖这个交易日历来进行了
+        with open(DT.g_calendar_file, 'r', encoding='utf-8') as f:
+            DT.g_calendar = json.load(f)
+        args.keep_fields = [i for i in range(195)]  # 全部字段序列,一共195个
     else:
         raise ValueError(f"数据集参数错误{args.DS}")
 
@@ -206,6 +215,11 @@ def get_args():
                             25, 26, 27, 28, 29, 30, 31, 32, 51, 52, 53, 54, 55, 56, 59, 60, 61, 62, 63, 64, 65, 66, 67,
                             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
                             91, 92, 93, 94, 95, 96, 97, 98, 129, 130, 131, 132]
+    elif args.mask_mf in [603]:
+        args.keep_fields = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                            25, 26, 27, 28, 29, 30, 31, 32, 51, 52, 53, 54, 55, 56, 59, 60, 61, 62, 63, 64, 65, 66, 67,
+                            68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+                            91, 92, 93, 94, 95, 96, 97, 98, 191, 192, 193, 194]
     elif args.mask_mf == 50:
         rm_fields = [i + 33 for i in range(18)]  # 18个资金流
         for rk in rm_fields:
@@ -358,10 +372,7 @@ def period_test(args, model_list, begin_date, end_date, prev_weight=None, tradeC
         targetFile = UTILS.make_output_json_name(args, tradeDay)
         targetFile = os.path.join('./output', targetFile)
         if os.path.exists(targetFile):
-            prev_w = UTILS.read_pmfile(targetFile)
-            if prev_w is None:
-                raise ValueError(f'无法恢复已有仓位文件: {targetFile}')
-            args.keepWeightDays = (args.keepWeightDays % args.TD) + 1
+            # print(f"日期{tradeDay}的结果文件{targetFile}已存在, 跳过...")
             continue
         print(f"*****{DT.timestr()}开始进行交易日{tradeDay}处理...")
 
@@ -431,7 +442,6 @@ def period_test(args, model_list, begin_date, end_date, prev_weight=None, tradeC
         bj_c.append(bjc)
         bj_w.append(bjw)
         trade_days.append(tradeDay)
-        # Template口径：直接比较前一次目标持仓与当前目标持仓。
         stepTr = UTILS.cal_tr(prev_w, next_w)
         tr.append(stepTr)  # 换手率(单向)
         trade_value.append(value * (1. - 2 * stepTr * tradeCost))  # 双向扣除交易成本
@@ -660,8 +670,10 @@ def year_test(args, model_list, startDate, endDate):
         sizeI = BA.get_factor_index('size', 'exp')
         sizeList = [x[sizeI] for x in list(year_ba.values())]  # size暴露list(日度)
         size_Exp = sum(sizeList) / len(sizeList)
-        base_alpha_daily = make_base_index(args, list(year_ba.keys()), 'alpha', 'value')
-        baseAlpha = sum(base_alpha_daily) / len(base_alpha_daily) * 252 if base_alpha_daily else 0.
+        baseAlpha = make_base_index(args,list(year_ba.keys()),'alpha','value') # 读取同等时间段内的业绩基准每日alpha收益数据
+        # 转换为年度alpha
+        if len(baseAlpha)>0:
+            baseAlpha = sum(baseAlpha) / len(baseAlpha) *252
 
     bj_c = sum(bj_c) / len(bj_c)
     bj_w = sum(bj_w) / len(bj_w)
@@ -719,7 +731,7 @@ def year_test(args, model_list, startDate, endDate):
     info = info + f",{beta:.4f},{offensive:.4f},{defensive:.4f},{hold_stock_m:.1f}"  # ,{avg_hold_days:.1f}"
     info = info + f",{scash_weight:.2f},{smv:.2f},{top1_m:.4f},{tr_m:.2f},{bj_c:.2f}/{bj_w:.2f},{v2:.2f}%"
     info = info + f",{abs_win_rate * 100:.2f}%,{win_loss_rate:.2f}"
-    info = info + f",{baseAlpha * 100:.2f}%,{alpha_year * 100:.2f}%,{alpha_IR:.2f},{size_Exp:.2f}"
+    info = info + f",{baseAlpha*100:.2f}%,{alpha_year * 100:.2f}%,{alpha_IR:.2f},{size_Exp:.2f}"
     output_log(logfile, info + "\n")
 
     logfile.close()
@@ -774,7 +786,6 @@ def build_model_list(args, model_path_list, device='cpu', modelType='A'):
         model_list.append(model)
     return model_args_list, model_list
 
-
 def read_index_badic(args):
     """
     读取某个指数的barra数据
@@ -790,38 +801,10 @@ def read_index_badic(args):
     bafile = os.path.join('/data/indexData/', f"{args.indexName}_barra.json")
     if not os.path.exists(bafile):
         print(f"{bafile}文件不存在")
-        return {}
+        return None
     with open(bafile, 'r', encoding='utf-8-sig') as file:
         ba_dict = json.load(file)
     return ba_dict
-
-
-def make_base_index(args, dateList, f, target):
-    """
-    读取某个业绩基准的barra数据(在指定的日期区间内)
-    """
-
-    # 首先读取整个字典
-    baseBA = read_index_badic(args)
-    if baseBA is None:
-        return []
-
-    vlist = []
-    for day in dateList:
-        if baseBA.__contains__(day):
-            if f == 'alpha':
-                # 获取alpha收益
-                vlist.append(baseBA[day]['pm_alpha'])
-            else:
-                if target == 'exp':
-                    # 某个因子暴露
-                    vlist.append(baseBA[day]['pm_exp'][f])
-                else:
-                    # 某个因子收益
-                    vlist.append(baseBA[day]['pm_value'][f])
-
-    return vlist
-
 
 
 def read_zz1000_exp():
@@ -902,6 +885,32 @@ def add_pool(sp, pool):
         else:
             pool[k] = copy.deepcopy(dv)
 
+def make_base_index(args, dateList, f, target):
+    """
+    读取某个业绩基准的barra数据(在指定的日期区间内)
+    """
+
+    # 首先读取整个字典
+    baseBA = read_index_badic(args)
+    if baseBA is None:
+        return None
+
+    vlist = []
+    for day in dateList:
+        if baseBA.__contains__(day):
+            if f == 'alpha':
+                # 获取alpha收益
+                vlist.append(baseBA[day]['pm_alpha'])
+            else:
+                if target == 'exp':
+                    # 某个因子暴露
+                    vlist.append(baseBA[day]['pm_exp'][f])
+                else:
+                    # 某个因子收益
+                    vlist.append(baseBA[day]['pm_value'][f])
+
+    return vlist
+
 
 def make_barra_year(year_day_list, year_weight):
     assert (len(year_day_list) == len(year_weight)), f"交易日期长度{len(year_day_list)},权重图长度{len(year_weight)}"
@@ -929,21 +938,37 @@ def make_barra_year(year_day_list, year_weight):
     return year_ba
 
 
-def make_summery_info(all_trade_day_list, Day_model, year_ba, args):
+def merge_dict(dicA, dicB):
+    """
+    两个结构完全相同的字典{key=date,value=v}
+    用dicB中的元素追加或者替换dicA中对应元素
+    """
+    for k, v in dicB.items():
+        dicA[k] = v
+    kl = sorted(list(dicA.keys()))
+    R = {k: dicA[k] for k in kl}
+    return R
+
+
+def make_summery_info(all_trade_day_list, Day_model, year_ba):
     # all_trade_day_list日期列表, Day_model是每日收益
     # year_ba是个list,每个元素是一个测试年的barra字典数据
     TD = len(all_trade_day_list)
     TM = len(Day_model)
     print(f"总交易日:{TD},模型日度相对收益列表长度:{TM}")
     assert TD == TM, "---请检查数据!!!---"
-    flag = UTILS.make_output_flag(args) + f'_COST{args.tradeCost}'
-    fn = f'./output/pd_list_{flag}.json'
-    nv = {}
+    fn = './output/pd_list.json'
+    pdOld = None  # 本地已经存在的日度收益
     if os.path.exists(fn):
-        with open(fn, encoding='utf-8') as f:
-            nv.update(json.load(f))
+        print(f"{fn}--模型每日收益数据文件已存在,将被覆盖,请注意!!!")
+        with open(fn, 'r', encoding='utf-8') as f:
+            pdOld = json.load(f)
+
+    nv = {}
     for day, val in zip(all_trade_day_list, Day_model):
         nv[day] = val
+    if pdOld is not None:
+        nv = merge_dict(pdOld, nv)
     with open(fn, 'w', encoding='utf-8') as f:
         json.dump(nv, f, indent=1)
 
@@ -951,15 +976,21 @@ def make_summery_info(all_trade_day_list, Day_model, year_ba, args):
     total_ba = {}
     for bd in year_ba:
         total_ba.update(bd)
-    fn = f'./output/pd_barra_{flag}.json'
+
+    kl = sorted(list(total_ba.keys()))
+    retBa = {k:total_ba[k] for k in kl}
+
+    fn = "./output/pd_barra.json"
+    pdOld = None  # 本地已经存在的barra数据
     if os.path.exists(fn):
-        with open(fn, encoding='utf-8') as f:
-            previous = json.load(f)
-        previous.update(total_ba)
-        total_ba = previous
+        print(f"{fn}--每日因子暴露和收益数据文件已存在,将被覆盖,请注意!!!")
+        with open(fn, 'r', encoding='utf-8') as f:
+            pdOld = json.load(f)
+    if pdOld is not None:
+        total_ba = merge_dict(total_ba, pdOld)
     with open(fn, 'w', encoding='utf-8') as f:
         json.dump(total_ba, f, indent=1)
-    return total_ba
+    return retBa
 
 
 if __name__ == '__main__':
@@ -1005,6 +1036,8 @@ if __name__ == '__main__':
 
     # ADD 20260430 把中证1000指数的因子暴露数据读取出来放到一个字典表中{key=date,value=[10个因子暴露值]}
     args.zz1000exp = read_zz1000_exp()
+
+    # STEP2: 数据归一化工具
 
     print(f"*****Total models:{len(models)}*****")
 
@@ -1078,12 +1111,12 @@ if __name__ == '__main__':
         yc += 1
     if args.SUM == 1:
         # 是汇总脚本,则需要做一些额外处理
-        year_ba = make_summery_info(all_trade_day_list, Day_model, year_ba, args)
+        year_ba = make_summery_info(all_trade_day_list, Day_model, year_ba)
 
         # 总的有效测试年度数大于1时,出一个汇总报告
         logfile = open("./log.csv", "a+", encoding="utf-8-sig")
         output_log(logfile,
-                   f"*****汇总结果:{args.md}***交易价格{args.price_target}**成本{args.tradeCost}**{args.DS}**{DT.timestr()}")
+                   f"*****汇总结果:{args.md}***交易价格{args.price_target}**成本{args.tradeCost}**多任务{args.multitask}**指数权重优化{args.indexpull}**约束类型{args.Factor_constraint}**{args.DS}**{DT.timestr()}**交易间隔{args.TD}**")
         output_log(logfile, title)  # title
         for txt in info:  # 分年测试结果
             output_log(logfile, txt)
@@ -1141,8 +1174,12 @@ if __name__ == '__main__':
         sizeI = BA.get_factor_index('size', 'exp')
         sizeList = [x[sizeI] for x in list(year_ba.values())]  # size暴露list(日度)
         size_Exp = sum(sizeList) / len(sizeList)
-        base_alpha_daily = make_base_index(args, list(year_ba.keys()), 'alpha', 'value')
-        baseAlpha = sum(base_alpha_daily) / len(base_alpha_daily) * 252 if base_alpha_daily else 0.
+        baseAlpha = make_base_index(args, list(year_ba.keys()), 'alpha', 'value')  # 读取同等时间段内的业绩基准每日alpha收益数据
+        # 转换为年度alpha
+        if len(baseAlpha) > 0:
+            baseAlpha = sum(baseAlpha) / len(baseAlpha) *252
+        else:
+            baseAlpha = 0.
 
         v2 = victory / len(all_vlist) * 100.
         gv = 1.
@@ -1158,7 +1195,7 @@ if __name__ == '__main__':
         info = info + f",{beta:.4f},{offensive:.4f},{defensive:.4f},{hold_stock:.1f}"  # ,{avg_hold_days:.1f}"
         info = info + f",{scash_weight:.2f},{smv:.2f},{top1:.4f},{tr:.2f},,{v2:.2f}%"
         info = info + f",{abs_win_rate * 100:.2f}%,{win_loss_rate:.2f}"
-        info = info + f",{baseAlpha * 100:.2f}%,{alpha_year * 100:.2f}%,{alpha_IR:.2f},{size_Exp:.2f}"
+        info = info + f",{baseAlpha *100:.2f}%,{alpha_year * 100:.2f}%,{alpha_IR:.2f},{size_Exp:.2f}"
         output_log(logfile, info + "\n")
         logfile.close()
     print(f"{DT.timestr()}***测试结束***")
