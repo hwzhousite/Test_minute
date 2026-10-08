@@ -648,6 +648,7 @@ def year_test(args, model_list, startDate, endDate):
 
     # 新增加功能20260628 在每个年份的回测跑完之后,根据权重图数据,调用barra计算每日的因子暴露和因子收益
     alpha_year = alpha_IR = size_Exp = 0.
+    baseAlpha = 0.
     year_ba = None
     if args.SUM == 1:
         print(f"{DT.timestr()}生成barra数据...")
@@ -659,6 +660,8 @@ def year_test(args, model_list, startDate, endDate):
         sizeI = BA.get_factor_index('size', 'exp')
         sizeList = [x[sizeI] for x in list(year_ba.values())]  # size暴露list(日度)
         size_Exp = sum(sizeList) / len(sizeList)
+        base_alpha_daily = make_base_index(args, list(year_ba.keys()), 'alpha', 'value')
+        baseAlpha = sum(base_alpha_daily) / len(base_alpha_daily) * 252 if base_alpha_daily else 0.
 
     bj_c = sum(bj_c) / len(bj_c)
     bj_w = sum(bj_w) / len(bj_w)
@@ -705,7 +708,7 @@ def year_test(args, model_list, startDate, endDate):
     v2 = victory / len(pd) * 100.
     output_log(logfile, f"model:{args.md}---at {DT.timestr()}")
     output_log(logfile, f"总测试区间:[{startDate}~{endDate}]-子区间类型:{args.period}-子区间个数:{len(pd)}")
-    title = f"区间/{args.period},累计价值,大盘{args.indexName},总超额,平均超额,MAD,MAD-te,Pstd,Mstd,Estd,Emae,SR,IR年化,MDD,EMDD,下行风险,SOR,CALMAR,BETA,进攻能力,防守能力,日均持股,CASH,CMV-亿,日均T1,日均TR,BJ,相对胜率,绝对胜率,盈亏比,Alpha年化,AlphaIR,SizeExp"
+    title = f"区间/{args.period},累计价值,大盘{args.indexName},总超额,平均超额,MAD,MAD-te,Pstd,Mstd,Estd,Emae,SR,IR年化,MDD,EMDD,下行风险,SOR,CALMAR,BETA,进攻能力,防守能力,日均持股,CASH,CMV-亿,日均T1,日均TR,BJ,相对胜率,绝对胜率,盈亏比,基准Alpha,Alpha年化,AlphaIR,SizeExp"
     output_log(logfile, title)
     info = f"{total_da}~{total_db},{gv:.4f},{gmv:.4f},{(gv - gmv) / gmv * 100:.2f}%,{mee * 100:.2f}%"
     info = info + f",{CM.get_day_diff(Day_market, Day_model)}"
@@ -716,7 +719,7 @@ def year_test(args, model_list, startDate, endDate):
     info = info + f",{beta:.4f},{offensive:.4f},{defensive:.4f},{hold_stock_m:.1f}"  # ,{avg_hold_days:.1f}"
     info = info + f",{scash_weight:.2f},{smv:.2f},{top1_m:.4f},{tr_m:.2f},{bj_c:.2f}/{bj_w:.2f},{v2:.2f}%"
     info = info + f",{abs_win_rate * 100:.2f}%,{win_loss_rate:.2f}"
-    info = info + f",{alpha_year * 100:.2f}%,{alpha_IR:.2f},{size_Exp:.2f}"
+    info = info + f",{baseAlpha * 100:.2f}%,{alpha_year * 100:.2f}%,{alpha_IR:.2f},{size_Exp:.2f}"
     output_log(logfile, info + "\n")
 
     logfile.close()
@@ -770,6 +773,55 @@ def build_model_list(args, model_path_list, device='cpu', modelType='A'):
         model_args_list.append(margs)
         model_list.append(model)
     return model_args_list, model_list
+
+
+def read_index_badic(args):
+    """
+    读取某个指数的barra数据
+    # 读取barra数据字典
+    # ba_dict[day] = {'qa_exp': qa_exp, #--{'factor':value}
+    #                 'qa_value': qa_value, #--{'factor':value}
+    #                 'qa_alpha': qa_alpha, #--value
+    #                 'pm_exp': pm_exp, #--{'factor':value}  ----42 这些是有用的
+    #                 'pm_value': pm_value, #--{'factor':value}----42 这些是有用的
+    #                 'pm_alpha': pm_alpha} #--value----这些是有用的
+    """
+
+    bafile = os.path.join('/data/indexData/', f"{args.indexName}_barra.json")
+    if not os.path.exists(bafile):
+        print(f"{bafile}文件不存在")
+        return {}
+    with open(bafile, 'r', encoding='utf-8-sig') as file:
+        ba_dict = json.load(file)
+    return ba_dict
+
+
+def make_base_index(args, dateList, f, target):
+    """
+    读取某个业绩基准的barra数据(在指定的日期区间内)
+    """
+
+    # 首先读取整个字典
+    baseBA = read_index_badic(args)
+    if baseBA is None:
+        return []
+
+    vlist = []
+    for day in dateList:
+        if baseBA.__contains__(day):
+            if f == 'alpha':
+                # 获取alpha收益
+                vlist.append(baseBA[day]['pm_alpha'])
+            else:
+                if target == 'exp':
+                    # 某个因子暴露
+                    vlist.append(baseBA[day]['pm_exp'][f])
+                else:
+                    # 某个因子收益
+                    vlist.append(baseBA[day]['pm_value'][f])
+
+    return vlist
+
 
 
 def read_zz1000_exp():
@@ -1089,6 +1141,8 @@ if __name__ == '__main__':
         sizeI = BA.get_factor_index('size', 'exp')
         sizeList = [x[sizeI] for x in list(year_ba.values())]  # size暴露list(日度)
         size_Exp = sum(sizeList) / len(sizeList)
+        base_alpha_daily = make_base_index(args, list(year_ba.keys()), 'alpha', 'value')
+        baseAlpha = sum(base_alpha_daily) / len(base_alpha_daily) * 252 if base_alpha_daily else 0.
 
         v2 = victory / len(all_vlist) * 100.
         gv = 1.
@@ -1104,7 +1158,7 @@ if __name__ == '__main__':
         info = info + f",{beta:.4f},{offensive:.4f},{defensive:.4f},{hold_stock:.1f}"  # ,{avg_hold_days:.1f}"
         info = info + f",{scash_weight:.2f},{smv:.2f},{top1:.4f},{tr:.2f},,{v2:.2f}%"
         info = info + f",{abs_win_rate * 100:.2f}%,{win_loss_rate:.2f}"
-        info = info + f",{alpha_year * 100:.2f}%,{alpha_IR:.2f},{size_Exp:.2f}"
+        info = info + f",{baseAlpha * 100:.2f}%,{alpha_year * 100:.2f}%,{alpha_IR:.2f},{size_Exp:.2f}"
         output_log(logfile, info + "\n")
         logfile.close()
     print(f"{DT.timestr()}***测试结束***")
