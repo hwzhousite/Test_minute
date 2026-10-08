@@ -14,7 +14,6 @@ import torch
 import utils_date as DT
 import utils as UTILS
 import common_utils as CM
-from data_utils import DataNormalizer_SWSJ
 import daily_infer_ms as InferTool
 import cal_value as CalTool
 import sys
