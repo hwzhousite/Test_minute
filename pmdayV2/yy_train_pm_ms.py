@@ -1659,9 +1659,10 @@ class LightningModel_PM(pl.LightningModule):
             target_price_tm = day_tm[:, :, self.args.price_target_index]  # 未来信息第m天(tm)的目标价 [B, M]
             target_price_allfuture = futureSeq[:, :, :, self.args.price_target_index]  # 未来信息的目标价 [B, M, pred_len]
 
-            stock_type_t1 = day_t1[:, :, self.args.limit_mark_index]  # [B,M] 未来信息第1天(t1)的的股票类型
-            # src_data是未归一化的原始数据(与推理端一致), 直接转换为int类型即可, 无需反归一化
-            stock_type_t1 = stock_type_t1.round().int()  # [B,M], 取值范围为1-5  {'主板': 1, '创业板': 2, '北交所': 3, '科创板': 4, 'ST': 5}
+            stock_type_t1 = day_t1[:, :, -2]  # [B,M] 未来信息第1天(t1)的的股票类型
+            # 需要将这个数据反归一化,并转换为int类型
+            stock_type_t1 = stock_type_t1 * self.args.limit_mark_type + self.args.limit_mark_base  # [B,M]
+            stock_type_t1 = stock_type_t1.int()  # [B,M], 取值范围为1-5  {'主板': 1, '创业板': 2, '北交所': 3, '科创板': 4, 'ST': 5}
 
             inputSeq = inputSeq.clone()
 
@@ -1739,8 +1740,8 @@ class LightningModel_PM(pl.LightningModule):
             if self.testing:
                 # 测试模型时,还要考虑padding的影响, 如果买入日或者交割日是padding的数据,表示真实交易无法发生
                 # 在这种情况下,将相对价格置为1
-                padd_mask_t2 = (day_t2[:, :, self.args.padding_flag_index] > 0.0001)  # [B,M]
-                padd_mask_t1 = (day_t1[:, :, self.args.padding_flag_index] > 0.0001)  # [B,M]
+                padd_mask_t2 = (day_t2[:, :, -1] > 0.0001)  # [B,M]
+                padd_mask_t1 = (day_t1[:, :, -1] > 0.0001)  # [B,M]
                 pm = padd_mask_t1 | padd_mask_t2  # [B,M]
                 next_relative_price[pm] = 1.0  # 置为1.0,表示真实交易无法发生
 
@@ -1857,7 +1858,6 @@ class LightningModel_PM(pl.LightningModule):
                     index_weights_with_cash
                     * clipped_relative_price_benchmark
                 ).sum(dim=1)
-                '''
                 print("\n[1] 原始收益率")
                 print(f"Mean : {future_return.mean().item():+.6f}")
                 print(f"Std  : {future_return.std(unbiased=False).item():.6f}")
@@ -1869,7 +1869,6 @@ class LightningModel_PM(pl.LightningModule):
                 print(f"Std  : {clipped_return.std(unbiased=False).item():.6f}")
                 print(f"Min  : {clipped_return.min().item():+.6f}")
                 print(f"Max  : {clipped_return.max().item():+.6f}")
-                '''
 
 
             if self.testing:
@@ -1977,7 +1976,7 @@ class LightningModel_PM(pl.LightningModule):
                 we, ce = CM.cal_weight_entropy(next_w)
                 weight_entropy += we
                 weight_cash += ce
-                b0, b2, b5, b10, b20, t1, t2 = CM.cal_big_stock_count(next_w, smooth_weight=1e-3)
+                b0, b2, b5, b10, b20, t1, t2 = CM.cal_big_stock_count(next_w)
                 BigStockCount0 += b0
                 BigStockCount2 += b2
                 BigStockCount5 += b5
@@ -2053,6 +2052,24 @@ class LightningModel_PM(pl.LightningModule):
         factor_deviation_episode_for_train = factor_deviation_episode.mean().detach().item()
 
 
+        print(
+            f"📊 Loss Total     : {dynamic_metrics['loss_total']:.6f} "
+            f"(Return: {dynamic_metrics['loss_return']:.6f} | Factor: {dynamic_metrics['loss_factor']:.6f})"
+        )
+        print(
+            f"📈 Return & Vol   : Mean Excess = {dynamic_metrics['mean_return']:.6f} | "
+            f"Std Excess = {dynamic_metrics['std_excess']:.6f} | "
+            f"Sample IR = {dynamic_metrics['sample_ir']:.4f}"
+        )
+        print(
+            f"🎛️ Gating Weights : Factor Gate = {dynamic_metrics['factor_gate']:.4f} | "
+            f"W_α = {dynamic_metrics['w_alpha']:.4f} | "
+            f"W_λ = {dynamic_metrics['w_lambda']:.2f}"
+        )
+        print(
+            f"🎯 Factor Dev     : Current Mean = {dynamic_metrics['factor_deviation']:.6f}"
+        )
+        
         if random.randint(1, 60) == 1:
             term, SR, sigma, mu, R = self.calc_risk_penalty_term(SR_epoch)
             print('SR term check', 'SR term:', term[0, :], 'SR:', SR[0, :], 'Sigma:', sigma[0, :], 'Average', mu[0, :],
@@ -2674,7 +2691,7 @@ class LightningModel_PM(pl.LightningModule):
             if self.trainer.is_global_zero:
                 totalBatchs = len(d_loader)
                 print(
-                    f"{CM.timestr()}***验证集{addinfo}总Batch数:{totalBatchs},batchSize:{d_loader.batch_size},总样本数:{len(d_loader.dataset)}")
+                    f"{CM.timestr()}***验证集{addinfo}总Batch数:{totalBatchs},batchSize:{self.args.batch_size},总样本数:{self.args.batch_size * totalBatchs}")
             return d_loader
         else:
             # 单独验证
@@ -2683,7 +2700,7 @@ class LightningModel_PM(pl.LightningModule):
             if self.trainer.is_global_zero:
                 totalBatchs = len(d_loader)
                 print(
-                    f"{CM.timestr()}***验证集{addinfo}总Batch数:{totalBatchs},batchSize:{d_loader.batch_size},总样本数:{len(d_loader.dataset)}")
+                    f"{CM.timestr()}***验证集{addinfo}总Batch数:{totalBatchs},batchSize:{self.args.batch_size},总样本数:{self.args.batch_size * totalBatchs}")
             return d_loader
 
     def test_dataloader(self):
