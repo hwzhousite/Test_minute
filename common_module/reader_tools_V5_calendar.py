@@ -227,6 +227,105 @@ def read_record_from_binary_step(binary_file_path, field_count, read_index, reco
     return result
 
 
+# FIX: 14 列原始分钟文件使用自身的日期/bar 键，不依赖 index.json 的截止日期。
+from functools import lru_cache
+import warnings
+
+
+def canonical_stock_code(code):
+    return str(code).strip().split('.')[0].zfill(6)
+
+
+def normalize_stock_index(index):
+    out = {}
+    for key, value in index.items():
+        key = canonical_stock_code(key)
+        if key in out:
+            raise ValueError(f"股票代码规范化后重复: {key}")
+        out[key] = value
+    return out
+
+
+def resolve_stock_bin(directory, code):
+    names = [str(code).strip(), canonical_stock_code(code)]
+    names += [canonical_stock_code(code) + suffix for suffix in ('.SH', '.SZ', '.BJ')]
+    paths = list(dict.fromkeys(os.path.join(directory, name + '.bin') for name in names))
+    for path in paths:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(f"分钟/日线文件缺失: stock={code}; tried={paths}")
+
+
+@lru_cache(maxsize=64)
+def _minute_file_index(path, accuracy, size, mtime_ns):
+    # 有界、进程内缓存；文件变化后重新建立索引。不缓存全部特征副本。
+    if accuracy not in ('f', 'd'):
+        raise ValueError(f"未知二进制精度: {accuracy}")
+    dtype = np.float64 if accuracy == 'd' else np.float32
+    width = 14 * np.dtype(dtype).itemsize
+    if size == 0 or size % width:
+        raise ValueError(f"分钟文件大小不符合14列/{accuracy}: {path}, bytes={size}")
+    raw = np.memmap(path, dtype=dtype, mode='r', shape=(size // width, 14))
+    meta = np.asarray(raw[:, [2, 3, 4, 6]])
+    if (not np.isfinite(meta).all() or not (meta == np.floor(meta)).all()
+            or not ((meta[:, 0] >= 1990) & (meta[:, 0] <= 2100)
+                    & (meta[:, 1] >= 1) & (meta[:, 1] <= 12)
+                    & (meta[:, 2] >= 1) & (meta[:, 2] <= 31)
+                    & (meta[:, 3] >= 1) & (meta[:, 3] <= 48)).all()):
+        raise ValueError(f"分钟年月日/bar非法，请核对accuracy={accuracy}和14列布局: {path}")
+    meta = meta.astype(np.int64)
+    dates = meta[:, 0] * 10000 + meta[:, 1] * 100 + meta[:, 2]
+    keys = dates * 100 + meta[:, 3]
+    order = np.argsort(keys, kind='stable')
+    keys = keys[order]
+    if np.any(keys[1:] == keys[:-1]):
+        raise ValueError(f"分钟日期/bar重复: {path}")
+    return raw, keys, order
+
+
+def read_minute_calendar_seq(directory, code, dates, accuracy='d',
+                             m5_first_only=False, missing_policy='warn'):
+    """返回[L*48,14]或[L,14]。缺bar填0且padding=1；原始有效bar: close>0且flag=0。
+
+    missing_policy='error'适合排查；'warn'允许上市前/缺文件窗口并发出诊断。
+    日期/bar元信息在填充位置也保留，避免下游时间检查把缺失误判为错位。
+    """
+    if missing_policy not in ('warn', 'error'):
+        raise ValueError(missing_policy)
+    dates = np.asarray(dates, dtype=np.int64)
+    bars = np.array([1]) if m5_first_only else np.arange(1, 49)
+    day = np.repeat(dates, len(bars))
+    bar = np.tile(bars, len(dates))
+    out = np.zeros((len(day), 14), dtype=np.float64)
+    out[:, 0] = int(canonical_stock_code(code))
+    out[:, 2], out[:, 3], out[:, 4] = day // 10000, day // 100 % 100, day % 100
+    out[:, 6], out[:, 13] = bar, 1
+    try:
+        path = resolve_stock_bin(directory, code)
+    except FileNotFoundError as exc:
+        if missing_policy == 'error':
+            raise
+        warnings.warn(str(exc), RuntimeWarning, stacklevel=2)
+        return torch.tensor(out, dtype=torch.float64)
+    stat = os.stat(path)
+    raw, keys, order = _minute_file_index(path, accuracy, stat.st_size, stat.st_mtime_ns)
+    wanted = day * 100 + bar
+    loc = np.searchsorted(keys, wanted)
+    found = loc < len(keys)
+    found[found] &= keys[loc[found]] == wanted[found]
+    out[found] = raw[order[loc[found]]]
+    valid = np.isfinite(out[:, 7:13]).all(axis=1) & (out[:, 10] > 0) & (out[:, 13] == 0)
+    out[~valid, 7:13] = 0
+    out[~valid, 13] = 1
+    if len(day) and not valid.any():
+        message = (f"分钟窗口无有效bar: stock={code}, requested={dates[0]}..{dates[-1]}, "
+                   f"file_dates={keys[0]//100}..{keys[-1]//100}, matched={found.sum()}, file={path}")
+        if missing_policy == 'error':
+            raise ValueError(message)
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
+    return torch.tensor(out, dtype=torch.float64)
+
+
 def read_one_stock_seq(data_path_bin, stock_code, start_idx, data_file_fields, need_seq_len, m5_first_only=False, accuracy='f'):
     """
     读取一只股票序列
@@ -709,6 +808,7 @@ class StockDataReaderTW:
         self.args.channels = data_config.get('channels')
         self.args.period = data_config.get('period')
         self.args.accuracy = data_config.get('accuracy')
+        self.args.raw_data = data_config.get('raw_data')
 
         self.ms_data_config = dc.get_config(args.ms_data_name)
 
@@ -949,7 +1049,7 @@ class StockDataReaderTW:
         data_loader = DataLoader(
             DiskBinDatasetTW(self, data_set),
             batch_size=self.args.batch_size, shuffle=self.args.shuffle,
-            num_workers=self.args.num_workers, prefetch_factor=4)
+            num_workers=self.args.num_workers, prefetch_factor=4 if self.args.num_workers > 0 else None)
 
         print(f"{timestr()}创建data_loader完成，耗时{time.time() - time_start:.2f}秒")
         return data_loader
@@ -1110,6 +1210,20 @@ class DiskBinDatasetON(Dataset):
         :return: 股票序列[S,L,C]_
         """
 
+        if (self.period == 'five_minute' and self.args.channels == 14
+                and getattr(self.args, 'raw_data', None) == 'Y'):
+            dates = [int(d) for d in calendar]
+            first = dates.index(int(start_date_key))
+            bar_offset = int(minute_idx or 0)
+            days = math.ceil((bar_offset + need_seq_len) / 48)
+            if first + days > len(dates):
+                raise ValueError('分钟窗口超出交易日历')
+            return torch.stack([read_minute_calendar_seq(
+                self.args.data_path_bin, stock, dates[first:first + days],
+                accuracy=self.args.accuracy,
+                missing_policy=getattr(self.args, 'minute_missing_policy', 'warn'),
+            )[bar_offset:bar_offset + need_seq_len] for stock in stock_list])
+
         # 单线程读取
         seq = []
         for stock_code in stock_list:
@@ -1164,6 +1278,7 @@ class StockDataReaderON:
         self.args.channels = data_config.get('channels')
         self.args.period = data_config.get('period')
         self.args.accuracy = data_config.get('accuracy')
+        self.args.raw_data = data_config.get('raw_data')
 
         if os.path.exists(args.chengfen):
             with open(args.chengfen, 'r', encoding='utf-8') as f:
@@ -1713,7 +1828,7 @@ class StockDataReaderON:
             DiskBinDatasetON(self, self.args, data_set, self.dict_stock, self.dict_date, self.data_set_dict,
                              self.all_dates_index, self.args.period),
             batch_size=self.args.batch_size, shuffle=self.args.shuffle,
-            num_workers=self.args.num_workers, prefetch_factor=4)
+            num_workers=self.args.num_workers, prefetch_factor=4 if self.args.num_workers > 0 else None)
 
         print(f"{timestr()}创建data_loader完成，耗时{time.time() - time_start:.2f}秒")
         return data_loader
@@ -2005,3 +2120,4 @@ if __name__ == "__main__":
     #
     # original_data = cd.restore_original_data(d_data)
     pass
+

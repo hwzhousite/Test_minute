@@ -101,7 +101,7 @@ class DailyWithMinuteReader(v5.StockDataReaderON):
     def __init__(self, args):
         self.ms_data_config = DatasetConfig().get_config(args.ms_data_name)
         with open(self.ms_data_config['index_file'], encoding='utf-8') as f:
-            self.ms_index = {str(k).split('.')[0].zfill(6): v for k, v in json.load(f).items()}
+            self.ms_index = v5.normalize_stock_index(json.load(f))
         self.ms_calendar = [int(d) for d in calendar]
         self.ms_calendar_index = {d: i for i, d in enumerate(self.ms_calendar)}
         super().__init__(args)
@@ -109,12 +109,26 @@ class DailyWithMinuteReader(v5.StockDataReaderON):
     def read_minutes(self, stocks, day):
         days = self.args.minute_before_num + self.args.minute_after_num
         channels = self.ms_data_config['channels']
-        out = np.zeros((len(stocks), days, 48, channels), dtype=np.float32)
         offset = getattr(self.args, 'minute_offset_days',
                          self.args.day_before_num - self.args.minute_before_num)
+        if offset is None:
+            offset = self.args.day_before_num - self.args.minute_before_num
         first = self.ms_calendar_index[int(day)] + offset
         if first < 0 or first + days > len(self.ms_calendar):
             raise ValueError('分钟窗口超出交易日历')
+        if channels == 14 and self.ms_data_config.get('raw_data') == 'Y':
+            # 原始14列文件可能缺日/缺bar，不能按index.json推算物理行号。
+            dates = self.ms_calendar[first:first + days]
+            first_only = getattr(self.args, 'm5_first_only', False)
+            bars = 1 if first_only else MINUTE_BARS_PER_DAY
+            rows = [v5.read_minute_calendar_seq(
+                self.ms_data_config['data_path_bin'], stock, dates,
+                accuracy=self.ms_data_config['accuracy'],
+                m5_first_only=first_only,
+                missing_policy=getattr(self.args, 'minute_missing_policy', 'warn'),
+            ).float().reshape(days, bars, channels) for stock in stocks]
+            return torch.stack(rows) if rows else torch.empty((0, days, bars, channels))
+        out = np.zeros((len(stocks), days, 48, channels), dtype=np.float32)
         dtype = np.float64 if self.ms_data_config['accuracy'] == 'd' else np.float32
         for j, stock in enumerate(stocks):
             code = str(stock).split('.')[0].zfill(6)
@@ -138,6 +152,8 @@ class DailyWithMinuteReader(v5.StockDataReaderON):
             dst = out[j].reshape(-1, channels)
             begin = (lo - first) * 48
             dst[begin:begin + bars] = data[:bars * channels].reshape(bars, channels)
+        if getattr(self.args, 'm5_first_only', False):
+            out = out[:, :, :1, :]
         return torch.from_numpy(out)
 
     def create_data_loader(self, start_time, end_time, refresh=False, stride_shift=False):
@@ -169,14 +185,26 @@ class DiskBinDatasetTW_V11(v5.DiskBinDatasetTW):
                                             self.args.channels, day_time_step, False,
                                             self.args.accuracy)  # [L, C1]
 
-            ms_si = self.all_dates_index[self.ms_dict_stock[stock_code][0]]  # 分钟文件首日索引
-            ms_start_idx = ms_ei - ms_si
-            assert ms_start_idx >= 0, f"分钟数据集起始索引必须>=0, {stock_code} ms_si-{ms_si} ms_ei-{ms_ei}"
-            ms_stock_data = read_one_stock_seq(self.DSD.ms_data_config['data_path_bin'], stock_code,
-                                               ms_start_idx * MINUTE_BARS_PER_DAY,
-                                               self.DSD.ms_data_config['channels'],
-                                               minute_time_step, self.args.m5_first_only,
-                                               self.DSD.ms_data_config['accuracy'])  # [L*48, C2]
+            config = self.DSD.ms_data_config
+            if config['channels'] == 14 and config.get('raw_data') == 'Y':
+                days = self.args.minute_before_num + self.args.minute_after_num
+                dates = [int(d) for d in calendar]
+                first = dates.index(int(start_date_key)) + offset
+                if first < 0 or first + days > len(dates):
+                    raise ValueError('分钟窗口超出交易日历')
+                ms_stock_data = v5.read_minute_calendar_seq(
+                    config['data_path_bin'], stock_code, dates[first:first + days],
+                    accuracy=config['accuracy'], m5_first_only=self.args.m5_first_only,
+                    missing_policy=getattr(self.args, 'minute_missing_policy', 'warn'))
+            else:
+                ms_si = self.all_dates_index[self.ms_dict_stock[stock_code][0]]  # 分钟文件首日索引
+                ms_start_idx = ms_ei - ms_si
+                assert ms_start_idx >= 0, f"分钟数据集起始索引必须>=0, {stock_code} ms_si-{ms_si} ms_ei-{ms_ei}"
+                ms_stock_data = read_one_stock_seq(self.DSD.ms_data_config['data_path_bin'], stock_code,
+                                                   ms_start_idx * MINUTE_BARS_PER_DAY,
+                                                   self.DSD.ms_data_config['channels'],
+                                                   minute_time_step, self.args.m5_first_only,
+                                                   self.DSD.ms_data_config['accuracy'])  # [L*48, C2]
 
             seq.append(stock_data)
             ms_seq.append(ms_stock_data.float())  # 分钟数据量大, 以float32返回以节省内存
@@ -292,7 +320,7 @@ class StockDataReaderTW_V11(v5.StockDataReaderTW):
             batch_size=self.args.batch_size,
             shuffle=self.args.shuffle,
             num_workers=self.args.num_workers,
-            prefetch_factor=4,
+            prefetch_factor=4 if self.args.num_workers > 0 else None,
         )
         print(f"{timestr()}创建data_loader完成，耗时{__import__('time').time() - time_start:.2f}秒")
         return data_loader
@@ -304,13 +332,9 @@ class DiskBinDatasetON_V11(v5.DiskBinDatasetON):
         if self.period == 'five_minute':
             m5_first = getattr(self.args, 'm5_first_only', False)
             if m5_first:
-                l_day = self.args.minute_before_num + self.args.minute_after_num
-                if seq.shape[1] != l_day:
-                    seq = reshape_minute_tensor(
-                        seq, self.args.minute_before_num, self.args.minute_after_num, True)
-            else:
-                seq = reshape_minute_tensor(
-                    seq, self.args.minute_before_num, self.args.minute_after_num, False)
+                seq = seq[:, ::MINUTE_BARS_PER_DAY, :]
+            seq = reshape_minute_tensor(
+                seq, self.args.minute_before_num, self.args.minute_after_num, m5_first)
         return seq
 
 
@@ -372,7 +396,7 @@ class StockDataReaderON_V11(v5.StockDataReaderON):
             batch_size=self.args.batch_size,
             shuffle=self.args.shuffle,
             num_workers=self.args.num_workers,
-            prefetch_factor=4,
+            prefetch_factor=4 if self.args.num_workers > 0 else None,
         )
         print(f"{timestr()}创建data_loader完成，耗时{__import__('time').time() - time_start:.2f}秒")
         return data_loader
@@ -474,3 +498,4 @@ class DataReaderV11:
 # 对外统一别名
 DataReader = DataReaderV11
 CheckData = CheckDataV11
+
